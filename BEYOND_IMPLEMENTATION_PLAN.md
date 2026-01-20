@@ -4,6 +4,39 @@
 
 This document provides a phased implementation plan for "The Beyond" - a persistent server-side pet simulation. Copy this into Claude Code to guide implementation.
 
+## Deployment Strategy
+
+### MVP Hosting (Month 1 - Test Period)
+
+**Backend & Database: Render (Free Tier)**
+- Node.js backend on Render Free Web Service (spins down after 15 min idle)
+- PostgreSQL on Render Free Database (**30-day expiration limit**)
+- GitHub auto-deploy enabled on push to main branch
+- Minimal user data storage during test period
+
+**Frontend: Vercel (Free Tier)**
+- Next.js hosted on Vercel
+- GitHub auto-deploy on push
+
+**Authentication: Simple MVP**
+- Email/password authentication (no OAuth complexity initially)
+- Store only essential user data: email, subscription status
+- No sensitive PII during test period
+
+### Production Upgrade (Within Month 1)
+
+**Required Upgrades Before Database Expiry:**
+- Render PostgreSQL Starter ($7/mo) - persistent database with backups
+- Consider Render Web Service Starter ($7/mo) - eliminates sleep behavior
+
+**Total Cost**: $7-14/month for production-ready setup
+
+**Why This Approach:**
+- Zero upfront cost to validate the concept
+- 30 days to test with real users before committing to paid tier
+- Straightforward migration path (same platform, just upgrade tier)
+- GitHub auto-deploy works the same on free and paid tiers
+
 -----
 
 ## Project Structure
@@ -73,22 +106,40 @@ Set up database schema and basic CRUD operations.
    ```bash
    mkdir beyond && cd beyond
    npm init -y
-   npm install typescript ts-node @types/node express pg dotenv
-   npm install -D nodemon
+   npm install typescript ts-node @types/node express pg dotenv bcrypt jsonwebtoken
+   npm install -D nodemon @types/bcrypt @types/jsonwebtoken
    npx tsc --init
    ```
 
-2. **Create database schema** (`src/db/schema.sql`)
+2. **Set up Render PostgreSQL (Free - 30 Day Test Period)**
+
+   **IMPORTANT: Free Render databases expire after 30 days. Plan to upgrade to paid tier ($7/mo) within the first month if keeping user data.**
+
+   - Create Render account and link GitHub repository
+   - Create new PostgreSQL instance (Free tier: 1 GB, expires in 30 days)
+   - Copy `DATABASE_URL` (Internal Database URL) from Render dashboard
+   - Add to `.env` file locally and to Render Web Service environment variables
+
+   **Migration to Paid Tier Checklist (Before Day 25):**
+   - [ ] Upgrade database to Starter tier ($7/mo)
+   - [ ] Verify backups are enabled
+   - [ ] Test connection from backend
+   - [ ] Update any hardcoded references to database URL
+
+3. **Create database schema** (`src/db/schema.sql`)
 
    ```sql
    -- Users
    CREATE TABLE users (
        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
        email VARCHAR(255) UNIQUE NOT NULL,
+       password_hash VARCHAR(255) NOT NULL,
        subscription_status VARCHAR(50) DEFAULT 'free',
        subscription_expires_at TIMESTAMP,
        created_at TIMESTAMP DEFAULT NOW()
    );
+
+   CREATE INDEX idx_users_email ON users(email);
 
    -- Pets
    CREATE TABLE pets (
@@ -158,6 +209,15 @@ Set up database schema and basic CRUD operations.
 
    ```typescript
    export interface User {
+     id: string;
+     email: string;
+     passwordHash: string; // Never expose in API responses
+     subscriptionStatus: 'free' | 'subscribed' | 'lapsed';
+     subscriptionExpiresAt: Date | null;
+     createdAt: Date;
+   }
+
+   export interface UserPublic {
      id: string;
      email: string;
      subscriptionStatus: 'free' | 'subscribed' | 'lapsed';
@@ -380,10 +440,18 @@ Set up database schema and basic CRUD operations.
          return result.rows[0] ? mapUserRow(result.rows[0]) : null;
        },
 
-       async create(email: string): Promise<User> {
+       async getByEmail(email: string): Promise<User | null> {
          const result = await pool.query(
-           'INSERT INTO users (email) VALUES ($1) RETURNING *',
+           'SELECT * FROM users WHERE email = $1',
            [email]
+         );
+         return result.rows[0] ? mapUserRow(result.rows[0]) : null;
+       },
+
+       async create(email: string, passwordHash: string): Promise<User> {
+         const result = await pool.query(
+           'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *',
+           [email, passwordHash]
          );
          return mapUserRow(result.rows[0]);
        },
@@ -464,10 +532,17 @@ Set up database schema and basic CRUD operations.
      return {
        id: row.id,
        email: row.email,
+       passwordHash: row.password_hash,
        subscriptionStatus: row.subscription_status,
        subscriptionExpiresAt: row.subscription_expires_at,
        createdAt: row.created_at,
      };
+   }
+
+   // Helper to strip sensitive fields from User for API responses
+   export function sanitizeUser(user: User): UserPublic {
+     const { passwordHash, ...publicUser } = user;
+     return publicUser as UserPublic;
    }
 
    export default db;
@@ -1106,9 +1181,20 @@ Create developer-only endpoints for testing, including generating Level 10 pets.
    /**
     * Create a test user
     */
-   export async function createTestUser(email?: string): Promise<User> {
+   export async function createTestUser(
+     email?: string,
+     password?: string
+   ): Promise<{ user: User; password: string }> {
      const testEmail = email || `test-${Date.now()}@example.com`;
-     return db.users.create(testEmail);
+     const testPassword = password || 'testpass123';
+
+     // Import hashPassword from auth
+     const bcrypt = require('bcrypt');
+     const passwordHash = await bcrypt.hash(testPassword, 10);
+
+     const user = await db.users.create(testEmail, passwordHash);
+
+     return { user, password: testPassword };
    }
 
    /**
@@ -1263,8 +1349,16 @@ Create developer-only endpoints for testing, including generating Level 10 pets.
     */
    router.post('/users', async (req, res) => {
      try {
-       const user = await dev.createTestUser(req.body.email);
-       res.json({ user });
+       const { email, password } = req.body;
+       const result = await dev.createTestUser(email, password);
+       res.json({
+         user: {
+           id: result.user.id,
+           email: result.user.email,
+         },
+         password: result.password,
+         note: 'Use these credentials to login via POST /api/auth/login',
+       });
      } catch (err) {
        res.status(500).json({ error: (err as Error).message });
      }
@@ -1412,11 +1506,261 @@ Create developer-only endpoints for testing, including generating Level 10 pets.
 
 -----
 
-## Phase 4: API & Visibility
+## Phase 4: Authentication (Simple MVP)
 
 ### Goal
 
-Create public API with subscription-based visibility rules.
+Implement basic email/password authentication for the MVP test period. Keep it simple - no OAuth, no complex features.
+
+### Tasks
+
+1. **Create authentication utilities** (`src/api/middleware/auth.ts`)
+
+   ```typescript
+   import { Request, Response, NextFunction } from 'express';
+   import jwt from 'jsonwebtoken';
+   import bcrypt from 'bcrypt';
+   import { db } from '../../db';
+
+   const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+   const SALT_ROUNDS = 10;
+
+   export interface AuthRequest extends Request {
+     userId?: string;
+   }
+
+   /**
+    * Hash a password
+    */
+   export async function hashPassword(password: string): Promise<string> {
+     return bcrypt.hash(password, SALT_ROUNDS);
+   }
+
+   /**
+    * Verify a password against a hash
+    */
+   export async function verifyPassword(password: string, hash: string): Promise<boolean> {
+     return bcrypt.compare(password, hash);
+   }
+
+   /**
+    * Generate a JWT token
+    */
+   export function generateToken(userId: string): string {
+     return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
+   }
+
+   /**
+    * Verify a JWT token
+    */
+   export function verifyToken(token: string): { userId: string } | null {
+     try {
+       return jwt.verify(token, JWT_SECRET) as { userId: string };
+     } catch {
+       return null;
+     }
+   }
+
+   /**
+    * Middleware: Require authentication
+    */
+   export async function requireAuth(
+     req: AuthRequest,
+     res: Response,
+     next: NextFunction
+   ): Promise<void> {
+     const authHeader = req.headers.authorization;
+
+     if (!authHeader || !authHeader.startsWith('Bearer ')) {
+       res.status(401).json({ error: 'Authentication required' });
+       return;
+     }
+
+     const token = authHeader.substring(7);
+     const payload = verifyToken(token);
+
+     if (!payload) {
+       res.status(401).json({ error: 'Invalid or expired token' });
+       return;
+     }
+
+     req.userId = payload.userId;
+     next();
+   }
+
+   /**
+    * Middleware: Optional authentication (doesn't fail if not authenticated)
+    */
+   export async function optionalAuth(
+     req: AuthRequest,
+     res: Response,
+     next: NextFunction
+   ): Promise<void> {
+     const authHeader = req.headers.authorization;
+
+     if (authHeader && authHeader.startsWith('Bearer ')) {
+       const token = authHeader.substring(7);
+       const payload = verifyToken(token);
+
+       if (payload) {
+         req.userId = payload.userId;
+       }
+     }
+
+     next();
+   }
+   ```
+
+2. **Create authentication routes** (`src/api/auth.ts`)
+
+   ```typescript
+   import { Router } from 'express';
+   import { db, sanitizeUser } from '../db';
+   import { hashPassword, verifyPassword, generateToken, requireAuth, AuthRequest } from './middleware/auth';
+
+   const router = Router();
+
+   /**
+    * POST /api/auth/register
+    * Register a new user
+    */
+   router.post('/register', async (req, res) => {
+     try {
+       const { email, password } = req.body;
+
+       // Validation
+       if (!email || !password) {
+         return res.status(400).json({ error: 'Email and password required' });
+       }
+
+       if (password.length < 8) {
+         return res.status(400).json({ error: 'Password must be at least 8 characters' });
+       }
+
+       // Check if user already exists
+       const existing = await db.users.getByEmail(email);
+       if (existing) {
+         return res.status(400).json({ error: 'Email already registered' });
+       }
+
+       // Create user
+       const passwordHash = await hashPassword(password);
+       const user = await db.users.create(email, passwordHash);
+
+       // Generate token
+       const token = generateToken(user.id);
+
+       res.json({
+         user: sanitizeUser(user),
+         token,
+       });
+     } catch (err) {
+       console.error('[AUTH] Register error:', err);
+       res.status(500).json({ error: 'Registration failed' });
+     }
+   });
+
+   /**
+    * POST /api/auth/login
+    * Login with email/password
+    */
+   router.post('/login', async (req, res) => {
+     try {
+       const { email, password } = req.body;
+
+       if (!email || !password) {
+         return res.status(400).json({ error: 'Email and password required' });
+       }
+
+       // Get user
+       const user = await db.users.getByEmail(email);
+       if (!user) {
+         return res.status(401).json({ error: 'Invalid credentials' });
+       }
+
+       // Verify password
+       const valid = await verifyPassword(password, user.passwordHash);
+       if (!valid) {
+         return res.status(401).json({ error: 'Invalid credentials' });
+       }
+
+       // Generate token
+       const token = generateToken(user.id);
+
+       res.json({
+         user: sanitizeUser(user),
+         token,
+       });
+     } catch (err) {
+       console.error('[AUTH] Login error:', err);
+       res.status(500).json({ error: 'Login failed' });
+     }
+   });
+
+   /**
+    * GET /api/auth/me
+    * Get current user info
+    */
+   router.get('/me', requireAuth, async (req: AuthRequest, res) => {
+     try {
+       const user = await db.users.getById(req.userId!);
+
+       if (!user) {
+         return res.status(404).json({ error: 'User not found' });
+       }
+
+       res.json({ user: sanitizeUser(user) });
+     } catch (err) {
+       console.error('[AUTH] Get me error:', err);
+       res.status(500).json({ error: 'Failed to get user' });
+     }
+   });
+
+   export default router;
+   ```
+
+3. **Update environment variables** (`.env.example`)
+
+   ```
+   DATABASE_URL=postgres://localhost:5432/beyond
+   PORT=3000
+   NODE_ENV=development
+   BASE_URL=http://localhost:3000
+   START_SIMULATION=true
+   JWT_SECRET=change-this-to-a-random-secret-in-production
+   ```
+
+### Deliverables
+
+- [ ] User registration endpoint
+- [ ] User login endpoint
+- [ ] JWT token generation and validation
+- [ ] Password hashing with bcrypt
+- [ ] Auth middleware for protected routes
+
+### Security Notes for MVP
+
+**Acceptable for Test Period:**
+- Simple JWT tokens (no refresh tokens)
+- Basic password requirements (8+ characters)
+- No email verification
+- No password reset flow
+- No rate limiting
+
+**Must Add Before Production:**
+- Email verification
+- Password reset via email
+- Rate limiting on auth endpoints
+- Refresh token rotation
+- Consider adding OAuth (Google, Apple) for better UX
+
+-----
+
+## Phase 5: API & Visibility
+
+### Goal
+
+Create public API with subscription-based visibility rules and integrate authentication.
 
 ### Tasks
 
@@ -1570,6 +1914,7 @@ Create public API with subscription-based visibility rules.
    import { db } from '../db';
    import { getVisiblePetData } from './middleware/visibility';
    import { getTemplate } from '../templates/journal';
+   import { requireAuth, optionalAuth, AuthRequest } from './middleware/auth';
 
    const router = Router();
 
@@ -1577,13 +1922,15 @@ Create public API with subscription-based visibility rules.
     * POST /api/pets/upload
     * Upload a pet to The Beyond (from mobile app)
     */
-   router.post('/upload', async (req, res) => {
+   router.post('/upload', requireAuth, async (req: AuthRequest, res) => {
      try {
-       const { userId, name, personality, appearance } = req.body;
+       const { name, personality, appearance } = req.body;
 
-       if (!userId || !name || !personality) {
+       if (!name || !personality) {
          return res.status(400).json({ error: 'Missing required fields' });
        }
+
+       const userId = req.userId!; // From auth middleware
 
        // Map 6-axis personality to 2-axis
        const boldness = (
@@ -1640,7 +1987,7 @@ Create public API with subscription-based visibility rules.
     * GET /api/pets/:id
     * Get pet status (with visibility rules)
     */
-   router.get('/:id', async (req, res) => {
+   router.get('/:id', optionalAuth, async (req: AuthRequest, res) => {
      try {
        const pet = await db.pets.getById(req.params.id);
 
@@ -1648,9 +1995,8 @@ Create public API with subscription-based visibility rules.
          return res.status(404).json({ error: 'Pet not found' });
        }
 
-       // Get user from auth (simplified - implement proper auth)
-       const userId = req.headers['x-user-id'] as string;
-       const user = userId ? await db.users.getById(userId) : null;
+       // Get user if authenticated
+       const user = req.userId ? await db.users.getById(req.userId) : null;
 
        // Check if user owns this pet or is just viewing
        const isOwner = user && pet.ownerId === user.id;
@@ -1668,7 +2014,7 @@ Create public API with subscription-based visibility rules.
     * GET /api/pets/:id/journal
     * Get pet journal (with visibility rules)
     */
-   router.get('/:id/journal', async (req, res) => {
+   router.get('/:id/journal', optionalAuth, async (req: AuthRequest, res) => {
      try {
        const pet = await db.pets.getById(req.params.id);
 
@@ -1676,8 +2022,7 @@ Create public API with subscription-based visibility rules.
          return res.status(404).json({ error: 'Pet not found' });
        }
 
-       const userId = req.headers['x-user-id'] as string;
-       const user = userId ? await db.users.getById(userId) : null;
+       const user = req.userId ? await db.users.getById(req.userId) : null;
        const isOwner = user && pet.ownerId === user.id;
        const isSubscribed = isOwner && user.subscriptionStatus === 'subscribed';
 
@@ -1702,8 +2047,9 @@ Create public API with subscription-based visibility rules.
 
    ```typescript
    import { Router } from 'express';
-   import { db } from '../db';
+   import { db, sanitizeUser } from '../db';
    import { getVisiblePetData } from './middleware/visibility';
+   import { requireAuth, AuthRequest } from './middleware/auth';
 
    const router = Router();
 
@@ -1711,13 +2057,9 @@ Create public API with subscription-based visibility rules.
     * GET /api/me/pets
     * Get current user's pets
     */
-   router.get('/me/pets', async (req, res) => {
+   router.get('/me/pets', requireAuth, async (req: AuthRequest, res) => {
      try {
-       const userId = req.headers['x-user-id'] as string;
-
-       if (!userId) {
-         return res.status(401).json({ error: 'Authentication required' });
-       }
+       const userId = req.userId!;
 
        const user = await db.users.getById(userId);
        if (!user) {
@@ -1741,14 +2083,10 @@ Create public API with subscription-based visibility rules.
     * PUT /api/me/subscription
     * Update subscription status (simplified - real implementation would validate with App Store)
     */
-   router.put('/me/subscription', async (req, res) => {
+   router.put('/me/subscription', requireAuth, async (req: AuthRequest, res) => {
      try {
-       const userId = req.headers['x-user-id'] as string;
+       const userId = req.userId!;
        const { status, expiresAt } = req.body;
-
-       if (!userId) {
-         return res.status(401).json({ error: 'Authentication required' });
-       }
 
        const user = await db.users.updateSubscription(
          userId,
@@ -1756,7 +2094,7 @@ Create public API with subscription-based visibility rules.
          expiresAt ? new Date(expiresAt) : null
        );
 
-       res.json({ user });
+       res.json({ user: sanitizeUser(user) });
      } catch (err) {
        console.error('[API] Update subscription error:', err);
        res.status(500).json({ error: 'Failed to update subscription' });
@@ -1770,12 +2108,14 @@ Create public API with subscription-based visibility rules.
 
    ```typescript
    import { Router } from 'express';
+   import authRouter from './auth';
    import petsRouter from './pets';
    import usersRouter from './users';
    import devRouter from './dev';
 
    const router = Router();
 
+   router.use('/api/auth', authRouter);
    router.use('/api/pets', petsRouter);
    router.use('/api', usersRouter);
    router.use('/dev', devRouter);
@@ -1790,19 +2130,20 @@ Create public API with subscription-based visibility rules.
 
 ### Deliverables
 
-- [ ] Upload endpoint working
-- [ ] Pet status endpoint with visibility rules
-- [ ] Journal endpoint with visibility rules
-- [ ] User pets endpoint
-- [ ] Subscription update endpoint
+- [ ] Upload endpoint working with authentication
+- [ ] Pet status endpoint with visibility rules and optional auth
+- [ ] Journal endpoint with visibility rules and optional auth
+- [ ] User pets endpoint with required auth
+- [ ] Subscription update endpoint with required auth
+- [ ] Auth routes integrated into main router
 
 -----
 
-## Phase 5: Entry Point & Server
+## Phase 6: Entry Point & Server
 
 ### Goal
 
-Wire everything together into a running server.
+Wire everything together into a running server and prepare for Render deployment.
 
 ### Tasks
 
@@ -1873,14 +2214,25 @@ Wire everything together into a running server.
 3. **Create .env.example**
 
    ```
+   # Database
    DATABASE_URL=postgres://localhost:5432/beyond
+
+   # Server
    PORT=3000
    NODE_ENV=development
    BASE_URL=http://localhost:3000
    START_SIMULATION=true
+
+   # Authentication
+   JWT_SECRET=change-this-to-a-random-secret-in-production
+
+   # For Render deployment, these will be set via environment variables:
+   # - DATABASE_URL: Provided by Render PostgreSQL
+   # - PORT: Automatically set by Render
+   # - JWT_SECRET: Add this manually in Render dashboard
    ```
 
-4. **Create docker-compose.yml**
+4. **Create docker-compose.yml (for local development)**
 
    ```yaml
    version: '3.8'
@@ -1900,16 +2252,104 @@ Wire everything together into a running server.
      pgdata:
    ```
 
+5. **Create render.yaml (for Render deployment)**
+
+   ```yaml
+   services:
+     # Backend API
+     - type: web
+       name: beyond-api
+       runtime: node
+       plan: free  # Upgrade to 'starter' ($7/mo) for no-sleep behavior
+       repo: https://github.com/YOUR_USERNAME/pets-beyond
+       branch: main
+       buildCommand: npm install && npm run build
+       startCommand: npm start
+       envVars:
+         - key: NODE_ENV
+           value: production
+         - key: START_SIMULATION
+           value: true
+         - key: BASE_URL
+           sync: false  # Set in Render dashboard
+         - key: DATABASE_URL
+           fromDatabase:
+             name: beyond-db
+             property: connectionString
+         - key: JWT_SECRET
+           generateValue: true
+       healthCheckPath: /health
+       autoDeploy: true
+
+   databases:
+     # PostgreSQL Database
+     - name: beyond-db
+       plan: free  # IMPORTANT: Upgrade to 'starter' ($7/mo) within 30 days
+       databaseName: beyond
+       user: beyond
+   ```
+
+6. **Create .gitignore**
+
+   ```
+   node_modules/
+   dist/
+   .env
+   .env.local
+   *.log
+   .DS_Store
+   ```
+
+### Render Deployment Steps
+
+1. **Push to GitHub**
+   ```bash
+   git init
+   git add .
+   git commit -m "Initial commit"
+   git remote add origin https://github.com/YOUR_USERNAME/pets-beyond.git
+   git push -u origin main
+   ```
+
+2. **Create Render Account**
+   - Sign up at https://render.com
+   - Connect your GitHub account
+
+3. **Deploy from Dashboard** (if not using render.yaml)
+   - Create New PostgreSQL database (Free tier)
+   - Note the Internal Database URL
+   - Create New Web Service
+   - Connect to your GitHub repo
+   - Configure:
+     - Build Command: `npm install && npm run build`
+     - Start Command: `npm start`
+     - Add environment variables (DATABASE_URL, JWT_SECRET, etc.)
+   - Deploy
+
+4. **Run Database Migration**
+   ```bash
+   # Connect to Render PostgreSQL and run schema
+   psql <RENDER_DATABASE_URL> -f src/db/schema.sql
+   ```
+
+5. **Set Upgrade Reminder**
+   - Add calendar reminder for Day 25 to upgrade database
+   - Database will expire on Day 30
+
 ### Deliverables
 
-- [ ] Server starts and runs
+- [ ] Server starts and runs locally
 - [ ] Simulation auto-starts
 - [ ] Graceful shutdown works
 - [ ] Docker Compose for local DB
+- [ ] render.yaml configuration complete
+- [ ] Deployed to Render (free tier)
+- [ ] Database migration run on Render PostgreSQL
+- [ ] Calendar reminder set for database upgrade (Day 25)
 
 -----
 
-## Phase 6: Website (Basic)
+## Phase 7: Website (Basic)
 
 ### Goal
 
@@ -1941,22 +2381,40 @@ npm run db:migrate
 # 3. Start server in dev mode
 npm run dev
 
-# 4. Create test user
-curl -X POST http://localhost:3000/dev/users \
+# 4. Register a user
+curl -X POST http://localhost:3000/api/auth/register \
   -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com"}'
+  -d '{"email": "test@example.com", "password": "testpass123"}'
+# Returns: { "user": { "id": "...", ... }, "token": "..." }
 
-# 5. Generate Level 10 pet
+# Save the token for authenticated requests
+export TOKEN="<JWT_TOKEN_FROM_RESPONSE>"
+
+# 5. Generate Level 10 pet (using dev endpoint)
 curl -X POST http://localhost:3000/dev/pets/level10 \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"ownerId": "<USER_ID>", "name": "TestPet"}'
+
+# OR upload via the API (requires auth)
+curl -X POST http://localhost:3000/api/pets/upload \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"name": "TestPet", "personality": {"curious": 0.7, "brave": 0.8, "cautious": 0.3, "friendly": 0.9, "loyal": 0.8, "playful": 0.6}}'
 
 # 6. Trigger ticks manually
 curl -X POST http://localhost:3000/dev/tick
 
-# 7. Check pet status
+# 7. Check pet status (authenticated - full visibility if owner)
 curl http://localhost:3000/api/pets/<PET_ID> \
-  -H "x-user-id: <USER_ID>"
+  -H "Authorization: Bearer $TOKEN"
+
+# 8. Check pet status (unauthenticated - limited visibility)
+curl http://localhost:3000/api/pets/<PET_ID>
+
+# 9. Get all my pets
+curl http://localhost:3000/api/me/pets \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Testing Scenarios
@@ -1972,23 +2430,103 @@ curl http://localhost:3000/api/pets/<PET_ID> \
 
 ## Summary
 
-|Phase|Goal             |Time Estimate|
-|-----|-----------------|-------------|
-|1    |Database & Models|2-3 days     |
-|2    |Simulation Engine|3-4 days     |
-|3    |Developer Tools  |1-2 days     |
-|4    |API & Visibility |2-3 days     |
-|5    |Server Setup     |1 day        |
-|6    |Basic Website    |3-5 days     |
+|Phase|Goal                    |Key Tasks|
+|-----|------------------------|---------|
+|1    |Database & Models       |PostgreSQL setup on Render (free, 30-day limit), schema, CRUD operations|
+|2    |Simulation Engine       |Tick loop, actions, social system, death handling|
+|3    |Developer Tools         |Test pet generation, manual tick triggers, stat manipulation|
+|4    |Authentication (MVP)    |Simple email/password, JWT tokens, bcrypt hashing|
+|5    |API & Visibility        |Upload endpoint, visibility rules, subscription gating|
+|6    |Server Setup & Deploy   |Express server, Render deployment, auto-deploy from GitHub|
+|7    |Basic Website           |Next.js on Vercel, pet pages, paywall UI|
 
-**Total: ~2-3 weeks**
+**MVP Timeline: Test Period**
+- **Days 1-7**: Build core backend (Phases 1-3)
+- **Days 8-14**: Add auth and API (Phases 4-5)
+- **Days 15-21**: Deploy and build website (Phases 6-7)
+- **Days 22-30**: Test with real users, gather feedback
+- **Day 25**: **CRITICAL - Upgrade Render PostgreSQL to paid tier ($7/mo) to avoid data loss**
+
+**Post-MVP: Production Hardening**
+- Email verification
+- Password reset flow
+- OAuth (Google, Apple)
+- Rate limiting
+- Monitoring and alerting
+- Consider upgrading Render Web Service to eliminate sleep ($7/mo)
 
 -----
 
+## Deployment Verification Checklist
+
+After deploying to Render, verify the following:
+
+- [ ] Backend health check responds: `curl https://your-app.onrender.com/health`
+- [ ] Database connection works (check logs)
+- [ ] Can register a new user via API
+- [ ] Can login and receive JWT token
+- [ ] Can upload a pet (authenticated)
+- [ ] Simulation tick runs every 4 hours (check logs)
+- [ ] Pet status endpoint returns data
+- [ ] Paywall works for free users viewing pets outside Meadow
+- [ ] GitHub auto-deploy triggers on push to main
+
+## Critical Upgrade Path
+
+**Before Day 30:**
+
+1. **Day 25**: Upgrade Render PostgreSQL
+   - Go to Render dashboard → PostgreSQL → Upgrade to Starter ($7/mo)
+   - Verify connection still works
+   - Test backups are enabled
+
+2. **Optional**: Upgrade Render Web Service
+   - If cold starts are annoying users (25-30 seconds)
+   - Upgrade to Starter ($7/mo) to eliminate sleep behavior
+   - Or set up UptimeRobot to ping `/health` every 10 minutes (free workaround)
+
 ## Next Steps After MVP
 
-1. **Notifications**: Push and email notifications
-2. **Subscription Integration**: App Store IAP validation
-3. **Mobile App Integration**: Upload flow in main app
-4. **Beyond App**: Standalone app for watching pets
-5. **Analytics**: Track metrics for balancing
+### Month 2-3: Production Hardening
+
+1. **Authentication Improvements**
+   - Email verification
+   - Password reset via email
+   - OAuth (Google, Apple) for easier login
+   - Rate limiting on auth endpoints
+
+2. **Notifications**
+   - Email notifications for deaths
+   - Email notifications for new friendships (subscribed users)
+   - Daily digest emails
+
+3. **Monitoring & Reliability**
+   - Error tracking (Sentry)
+   - Uptime monitoring
+   - Database backups verification
+   - Performance monitoring
+
+### Month 4-6: Mobile Integration
+
+4. **Mobile App Integration**
+   - Upload flow in main roguelike app
+   - Deep linking to Beyond website
+   - Share pet links
+
+5. **Subscription Integration**
+   - App Store IAP validation
+   - Subscription management
+   - Free trial handling
+
+### Future: Expand The Beyond
+
+6. **Beyond App**
+   - Standalone app for watching pets
+   - Push notifications
+   - Interactive features (naming friendships, etc.)
+
+7. **Analytics & Balancing**
+   - Track pet survival rates by personality
+   - Track friendship formation rates
+   - Adjust danger levels and resource abundance
+   - Add new regions based on data
